@@ -1,57 +1,70 @@
 use std::path::{Path, PathBuf};
-use zed::settings::LspSettings;
+use zed::settings::{CommandSettings, LspSettings};
 use zed_extension_api::{
   self as zed, LanguageServerId, Result, Worktree,
   serde_json::{self, Value},
 };
 
-const WORKTREE_SERVER_PATH: &str = "node_modules/.bin/dprint";
-
+const WORKTREE_BIN: &str = "node_modules/.bin/dprint";
 const PACKAGE_NAME: &str = "dprint";
-
-const DPRINT_CONFIG_PATHS: &[&str] = &["dprint.json"];
+const DEFAULT_CONFIG_CANDIDATES: &[&str] = &["dprint.json", ".dprint.json"];
 
 struct DprintExtension;
 
 impl DprintExtension {
-  fn worktree_dprint_exists(&self, worktree: &zed::Worktree) -> bool {
-    // This is a workaround, as reading the file from wasm doesn't work.
-    // Instead we try to read the `package.json`, see if `dprint` is installed
-    let package_json = worktree
-      .read_text_file("package.json")
-      .unwrap_or(String::from(r#"{}"#));
+  fn worktree_rooted(&self, worktree: &Worktree, relative: &str) -> String {
+    Path::new(worktree.root_path().as_str())
+      .join(relative)
+      .to_string_lossy()
+      .to_string()
+  }
 
-    let deno_json = worktree
-      .read_text_file("deno.json")
-      .unwrap_or(String::from(r#"{}"#));
+  fn read_json_file(&self, worktree: &Worktree, path: &str) -> Option<Value> {
+    let contents = worktree.read_text_file(path).ok()?;
+    serde_json::from_str(contents.as_str()).ok()
+  }
 
-    let package_json: Option<serde_json::Value> = serde_json::from_str(package_json.as_str()).ok();
-    let deno_json: Option<serde_json::Value> = serde_json::from_str(deno_json.as_str()).ok();
+  fn worktree_dprint_exists(&self, worktree: &Worktree) -> bool {
+    let package_json = self.read_json_file(worktree, "package.json");
+    let deno_json = self.read_json_file(worktree, "deno.json");
 
     let in_package_json = package_json.is_some_and(|f| {
-      !f["dependencies"][PACKAGE_NAME].is_null() || !f["devDependencies"][PACKAGE_NAME].is_null()
+      f.get("dependencies")
+        .and_then(|deps| deps.get(PACKAGE_NAME))
+        .is_some()
+        || f
+          .get("devDependencies")
+          .and_then(|deps| deps.get(PACKAGE_NAME))
+          .is_some()
     });
 
-    let in_deno_json = deno_json.is_some_and(|f| !f["imports"][PACKAGE_NAME].is_null());
+    let in_deno_json = deno_json.is_some_and(|f| {
+      f.get("imports")
+        .and_then(|imports| imports.get(PACKAGE_NAME))
+        .is_some()
+    });
 
     in_package_json || in_deno_json
   }
 
-  // Returns the path if a config file exists
-  pub fn config_path(&self, worktree: &zed::Worktree, settings: &Value) -> Option<String> {
-    let config_path_setting = settings.get("config_path").and_then(|value| value.as_str());
-
-    if let Some(config_path) = config_path_setting {
+  /// Returns a resolved configuration path if present.
+  fn config_path(&self, worktree: &Worktree, settings: &Value) -> Option<PathBuf> {
+    if let Some(config_path) = settings.get("config_path").and_then(|v| v.as_str()) {
       if worktree.read_text_file(config_path).is_ok() {
-        return Some(config_path.to_string());
+        return Some(Path::new(worktree.root_path().as_str()).join(config_path));
       } else {
+        log::warn!(
+          "dprint config_path setting '{}' not found in worktree {}",
+          config_path,
+          worktree.root_path()
+        );
         return None;
       }
     }
 
-    for config_path in DPRINT_CONFIG_PATHS {
-      if worktree.read_text_file(config_path).is_ok() {
-        return Some(config_path.to_string());
+    for candidate in DEFAULT_CONFIG_CANDIDATES {
+      if worktree.read_text_file(candidate).is_ok() {
+        return Some(Path::new(worktree.root_path().as_str()).join(candidate));
       }
     }
 
@@ -64,6 +77,19 @@ impl DprintExtension {
       .and_then(|value| value.as_bool())
       .unwrap_or(false)
   }
+
+  fn command_with_custom_binary(
+    &self,
+    binary: &CommandSettings,
+    default_path: String,
+    default_args: Vec<String>,
+  ) -> zed::Command {
+    zed::Command {
+      command: binary.path.clone().unwrap_or(default_path),
+      args: binary.arguments.clone().unwrap_or(default_args),
+      env: Default::default(),
+    }
+  }
 }
 
 impl zed::Extension for DprintExtension {
@@ -74,33 +100,23 @@ impl zed::Extension for DprintExtension {
   fn language_server_command(
     &mut self,
     language_server_id: &LanguageServerId,
-    worktree: &zed::Worktree,
+    worktree: &Worktree,
   ) -> Result<zed::Command> {
     let settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
 
     let mut args = vec!["lsp".to_string()];
+    log::info!("dprint: preparing language server command");
 
-    log::info!("Executing server command");
-
-    // check and run dprint with custom binary
+    // Custom binary supplied by user settings
     if let Some(binary) = settings.binary {
-      return Ok(zed::Command {
-        command: binary
-          .path
-          .map_or(WORKTREE_SERVER_PATH.to_string(), |path| path),
-        args: binary.arguments.map_or(args, |args| args),
-        env: Default::default(),
-      });
+      let default_path = self.worktree_rooted(worktree, WORKTREE_BIN);
+      return Ok(self.command_with_custom_binary(&binary, default_path, args));
     }
 
-    // try to run from worktree dprint package
+    // Prefer workspace installation driven through node
     if self.worktree_dprint_exists(worktree) {
-      log::info!("dpring in workspace");
-
-      let server_path = Path::new(worktree.root_path().as_str())
-        .join(WORKTREE_SERVER_PATH)
-        .to_string_lossy()
-        .to_string();
+      log::info!("dprint: found workspace installation");
+      let server_path = self.worktree_rooted(worktree, WORKTREE_BIN);
 
       let mut node_args = vec![server_path];
       node_args.append(&mut args);
@@ -112,14 +128,27 @@ impl zed::Extension for DprintExtension {
       });
     }
 
-    let server_path = PathBuf::from("./node_modules/.bin/dprint");
-    log::info!("dpring not in workspace");
+    // Fallback: try to execute the local binary path directly (relative to worktree)
+    let server_path = self.worktree_rooted(worktree, WORKTREE_BIN);
+    log::info!(
+      "dprint: workspace install not detected; falling back to {}",
+      server_path
+    );
 
     Ok(zed::Command {
-      command: server_path.to_string_lossy().to_string(),
+      command: server_path,
       args,
       env: Default::default(),
     })
+  }
+
+  fn language_server_initialization_options(
+    &mut self,
+    language_server_id: &LanguageServerId,
+    worktree: &Worktree,
+  ) -> Result<Option<Value>> {
+    let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
+    Ok(lsp_settings.initialization_options)
   }
 
   fn language_server_workspace_configuration(
@@ -128,23 +157,7 @@ impl zed::Extension for DprintExtension {
     worktree: &Worktree,
   ) -> Result<Option<Value>> {
     let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
-
-    let Some(settings) = lsp_settings.settings else {
-      return Ok(Some(serde_json::json!({
-        "dprint": {},
-      })));
-    };
-
-    let config_path = self
-      .config_path(worktree, &settings)
-      .map(|p| Path::new(&worktree.root_path()).join(p));
-
-    Ok(Some(serde_json::json!({
-      "dprint": {
-        "requireConfiguration": self.require_config_file(&settings),
-        "configurationPath": config_path,
-      },
-    })))
+    Ok(lsp_settings.settings)
   }
 }
 
