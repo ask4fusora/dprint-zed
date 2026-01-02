@@ -1,8 +1,8 @@
-authors        = ["Osman Mesut Ozcan <panikka.studio>"]
+authors        = ["Osman Mesut Ozcan <panikka.studio>", "ask4fusora <ask4fusora@gmail.com>"]
 description    = "Dprint support for Zed"
 id             = "dprint"
 name           = "Dprint"
-repository     = "https://github.com/dprint/dprint"
+repository     = "https://github.com/panikkastudio/dprint-zed"
 schema_version = 1
 version        = "0.0.1"
 
@@ -23,6 +23,7 @@ languages = [
   "CSS",
   "GraphQL",
   "HTML",
+  "Markdown"
 ]
 
 [language_servers.dprint.language_ids]
@@ -38,3 +39,4 @@ languages = [
 "TSX"        = "typescriptreact"
 "TypeScript" = "typescript"
 "Vue.js"     = "vuejs"
+"Markdown"   = "markdown"
