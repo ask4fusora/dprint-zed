@@ -1,94 +1,283 @@
-use std::path::{Path, PathBuf};
-use zed::settings::{CommandSettings, LspSettings};
+use std::{
+  fs,
+  path::{Path, PathBuf},
+};
 use zed_extension_api::{
-  self as zed, LanguageServerId, Result, Worktree,
+  self as zed, Architecture, DownloadedFileType, GithubRelease, GithubReleaseOptions,
+  LanguageServerId, LanguageServerInstallationStatus, Os, Worktree,
   serde_json::{self, Value},
+  settings::LspSettings,
 };
 
-const WORKTREE_BIN: &str = "node_modules/.bin/dprint";
-const PACKAGE_NAME: &str = "dprint";
-const DEFAULT_CONFIG_CANDIDATES: &[&str] = &["dprint.json", ".dprint.json"];
+struct AutoInstallerConfig<'config> {
+  github_repo: &'config str,
+  release_folder_prefix: &'config str,
+}
+
+trait AutoInstallerArtifacts {
+  fn binary_path(&self, version: &str, os: Os) -> PathBuf;
+  fn asset_name(&self, architecture: Architecture, os: Os) -> zed::Result<String>;
+}
+
+impl<'config> AutoInstallerArtifacts for AutoInstallerConfig<'config> {
+  fn binary_path(&self, version: &str, os: Os) -> PathBuf {
+    let file_extension = match os {
+      Os::Windows => ".exe",
+      Os::Mac | Os::Linux => "",
+    };
+
+    PathBuf::from(format!(
+      "{folder_prefix}{version}/dprint{file_extension}",
+      folder_prefix = self.release_folder_prefix,
+      version = version,
+      file_extension = file_extension,
+    ))
+  }
+
+  fn asset_name(&self, architecture: Architecture, os: Os) -> zed::Result<String> {
+    let architecture = match architecture {
+      Architecture::X8664 => "x86_64",
+      Architecture::Aarch64 => "aarch64",
+      Architecture::X86 => {
+        return Err(
+          concat!(
+            "Unsupported architecture: x86. ",
+            "Consider manually installing dprint on your machine or worktree instead."
+          )
+          .into(),
+        );
+      }
+    };
+
+    let os = match os {
+      Os::Linux => "unknown-linux-gnu",
+      Os::Mac => "apple-darwin",
+      Os::Windows => "pc-windows-msvc",
+    };
+
+    Ok(format!("dprint-{architecture}-{os}.zip",))
+  }
+}
+
+struct WorktreeConfig<'config> {
+  binary_basename: &'config str,
+  worktree_binary_path: &'config str,
+  node_package_name: &'config str,
+}
+
+struct InstallerConfig<'config> {
+  auto_installer: AutoInstallerConfig<'config>,
+  worktree: WorktreeConfig<'config>,
+}
+
+const DPRINT_CONFIG: InstallerConfig = InstallerConfig {
+  auto_installer: AutoInstallerConfig {
+    github_repo: "dprint/dprint",
+    release_folder_prefix: "dprint-",
+  },
+  worktree: WorktreeConfig {
+    binary_basename: "dprint",
+    worktree_binary_path: "node_modules/.bin/dprint",
+    node_package_name: "dprint",
+  },
+};
+
+struct AutoInstaller<'config> {
+  config: &'config AutoInstallerConfig<'config>,
+  latest_release: GithubRelease,
+  os: Os,
+  architecture: Architecture,
+  language_server_id: LanguageServerId,
+  binary_path: PathBuf,
+}
+
+impl<'config> AutoInstaller<'config> {
+  fn try_new(
+    config: &'config AutoInstallerConfig<'config>,
+    language_server_id: &LanguageServerId,
+  ) -> zed::Result<Self> {
+    let latest_release = zed::latest_github_release(
+      config.github_repo,
+      GithubReleaseOptions {
+        require_assets: true,
+        pre_release: false,
+      },
+    )?;
+
+    let (os, architecture) = zed::current_platform();
+
+    let binary_path = config.binary_path(&latest_release.version, os);
+
+    Ok(Self {
+      config,
+      latest_release,
+      os,
+      architecture,
+      language_server_id: language_server_id.clone(),
+      binary_path,
+    })
+  }
+
+  fn is_latest_release_installed(&self) -> bool {
+    self.binary_path.is_file()
+  }
+
+  fn ensure_installed(&self) -> zed::Result<PathBuf> {
+    zed::set_language_server_installation_status(
+      &self.language_server_id,
+      &LanguageServerInstallationStatus::CheckingForUpdate,
+    );
+
+    if self.is_latest_release_installed() {
+      return Ok(self.binary_path.clone());
+    }
+
+    self.remove_old_releases()?;
+    self.download_new_release()?;
+
+    Ok(self.binary_path.clone())
+  }
+
+  fn remove_old_releases(&self) -> zed::Result<()> {
+    for entry in
+      fs::read_dir(".").map_err(|error| format!("Failed to list working directory.{error:?}"))?
+    {
+      let entry = entry.map_err(|error| format!("Failed to load directory entry.{error:?}"))?;
+      let entry_path = entry.path();
+      let Some(entry_name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+        continue;
+      };
+
+      if !entry_name.starts_with(self.config.release_folder_prefix) {
+        continue;
+      }
+
+      let entry_metadata = entry
+        .metadata()
+        .map_err(|error| format!("Failed to stat {entry_path:?}.{error:?}"))?;
+
+      if entry_metadata.is_dir() {
+        fs::remove_dir_all(&entry_path)
+          .map_err(|error| format!("Failed to remove directory {entry_path:?}.{error:?}"))?;
+      } else {
+        fs::remove_file(&entry_path)
+          .map_err(|error| format!("Failed to remove file {entry_path:?}.{error:?}"))?;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn download_new_release(&self) -> zed::Result<()> {
+    zed::set_language_server_installation_status(
+      &self.language_server_id,
+      &LanguageServerInstallationStatus::Downloading,
+    );
+
+    let asset_name = self.config.asset_name(self.architecture, self.os)?;
+
+    let asset = self
+      .latest_release
+      .assets
+      .iter()
+      .find(|asset| asset.name == asset_name)
+      .ok_or_else(|| format!("No compatible asset found for {asset_name:?}."))?;
+
+    zed::download_file(
+      &asset.download_url,
+      &format!(
+        "{}{}",
+        self.config.release_folder_prefix, self.latest_release.version
+      ),
+      DownloadedFileType::Zip,
+    )
+  }
+}
 
 struct DprintExtension;
 
 impl DprintExtension {
-  fn worktree_rooted(&self, worktree: &Worktree, relative: &str) -> String {
-    Path::new(worktree.root_path().as_str())
-      .join(relative)
-      .to_string_lossy()
-      .to_string()
+  fn language_server_binary_path(
+    &self,
+    language_server_id: &LanguageServerId,
+    worktree: &Worktree,
+  ) -> zed::Result<String> {
+    let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
+
+    if let Some(path) = lsp_settings
+      .binary
+      .as_ref()
+      .and_then(|binary| binary.path.clone())
+    {
+      return Ok(path);
+    }
+
+    if self.worktree_dprint_binary_exists(worktree) {
+      return Ok(
+        Path::new(&worktree.root_path())
+          .join(DPRINT_CONFIG.worktree.worktree_binary_path)
+          .to_string_lossy()
+          .to_string(),
+      );
+    }
+
+    if let Some(path) = worktree.which(DPRINT_CONFIG.worktree.binary_basename) {
+      return Ok(path);
+    }
+
+    let binary_manager = AutoInstaller::try_new(&DPRINT_CONFIG.auto_installer, language_server_id)?;
+
+    return Ok(
+      binary_manager
+        .ensure_installed()?
+        .to_string_lossy()
+        .to_string(),
+    );
+  }
+
+  fn language_server_arguments(
+    &self,
+    language_server_id: &LanguageServerId,
+    worktree: &Worktree,
+  ) -> zed::Result<Vec<String>> {
+    let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
+
+    if let Some(arguments) = lsp_settings
+      .binary
+      .as_ref()
+      .and_then(|binary| binary.arguments.clone())
+    {
+      return Ok(arguments);
+    }
+
+    Ok(vec!["lsp".into()])
   }
 
   fn read_json_file(&self, worktree: &Worktree, path: &str) -> Option<Value> {
     let contents = worktree.read_text_file(path).ok()?;
-    serde_json::from_str(contents.as_str()).ok()
+    serde_json::from_str(&contents).ok()
   }
 
-  fn worktree_dprint_exists(&self, worktree: &Worktree) -> bool {
+  fn worktree_dprint_binary_exists(&self, worktree: &Worktree) -> bool {
     let package_json = self.read_json_file(worktree, "package.json");
     let deno_json = self.read_json_file(worktree, "deno.json");
+    let node_package_name = DPRINT_CONFIG.worktree.node_package_name;
 
-    let in_package_json = package_json.is_some_and(|f| {
-      f.get("dependencies")
-        .and_then(|deps| deps.get(PACKAGE_NAME))
-        .is_some()
-        || f
-          .get("devDependencies")
-          .and_then(|deps| deps.get(PACKAGE_NAME))
-          .is_some()
+    let is_in_package_json = package_json.is_some_and(|f| {
+      !f["dependencies"][node_package_name].is_null()
+        || !f["devDependencies"][node_package_name].is_null()
     });
 
-    let in_deno_json = deno_json.is_some_and(|f| {
-      f.get("imports")
-        .and_then(|imports| imports.get(PACKAGE_NAME))
-        .is_some()
-    });
+    let is_in_deno_json = deno_json.is_some_and(|f| !f["imports"][node_package_name].is_null());
 
-    in_package_json || in_deno_json
-  }
-
-  /// Returns a resolved configuration path if present.
-  fn config_path(&self, worktree: &Worktree, settings: &Value) -> Option<PathBuf> {
-    if let Some(config_path) = settings.get("config_path").and_then(|v| v.as_str()) {
-      if worktree.read_text_file(config_path).is_ok() {
-        return Some(Path::new(worktree.root_path().as_str()).join(config_path));
-      } else {
-        log::warn!(
-          "dprint config_path setting '{}' not found in worktree {}",
-          config_path,
-          worktree.root_path()
-        );
-        return None;
-      }
+    if !(is_in_package_json || is_in_deno_json) {
+      return false;
     }
 
-    for candidate in DEFAULT_CONFIG_CANDIDATES {
-      if worktree.read_text_file(candidate).is_ok() {
-        return Some(Path::new(worktree.root_path().as_str()).join(candidate));
-      }
-    }
+    let worktree_binary_path =
+      Path::new(&worktree.root_path()).join(DPRINT_CONFIG.worktree.worktree_binary_path);
 
-    None
-  }
-
-  fn require_config_file(&self, settings: &Value) -> bool {
-    settings
-      .get("require_config_file")
-      .and_then(|value| value.as_bool())
-      .unwrap_or(false)
-  }
-
-  fn command_with_custom_binary(
-    &self,
-    binary: &CommandSettings,
-    default_path: String,
-    default_args: Vec<String>,
-  ) -> zed::Command {
-    zed::Command {
-      command: binary.path.clone().unwrap_or(default_path),
-      args: binary.arguments.clone().unwrap_or(default_args),
-      env: Default::default(),
-    }
+    worktree_binary_path.is_file()
   }
 }
 
@@ -101,42 +290,12 @@ impl zed::Extension for DprintExtension {
     &mut self,
     language_server_id: &LanguageServerId,
     worktree: &Worktree,
-  ) -> Result<zed::Command> {
-    let settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
-
-    let mut args = vec!["lsp".to_string()];
-    log::info!("dprint: preparing language server command");
-
-    // Custom binary supplied by user settings
-    if let Some(binary) = settings.binary {
-      let default_path = self.worktree_rooted(worktree, WORKTREE_BIN);
-      return Ok(self.command_with_custom_binary(&binary, default_path, args));
-    }
-
-    // Prefer workspace installation driven through node
-    if self.worktree_dprint_exists(worktree) {
-      log::info!("dprint: found workspace installation");
-      let server_path = self.worktree_rooted(worktree, WORKTREE_BIN);
-
-      let mut node_args = vec![server_path];
-      node_args.append(&mut args);
-
-      return Ok(zed::Command {
-        command: zed::node_binary_path()?,
-        args: node_args,
-        env: Default::default(),
-      });
-    }
-
-    // Fallback: try to execute the local binary path directly (relative to worktree)
-    let server_path = self.worktree_rooted(worktree, WORKTREE_BIN);
-    log::info!(
-      "dprint: workspace install not detected; falling back to {}",
-      server_path
-    );
+  ) -> zed::Result<zed::Command> {
+    let command = self.language_server_binary_path(language_server_id, worktree)?;
+    let args = self.language_server_arguments(language_server_id, worktree)?;
 
     Ok(zed::Command {
-      command: server_path,
+      command,
       args,
       env: Default::default(),
     })
