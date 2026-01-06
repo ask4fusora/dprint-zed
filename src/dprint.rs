@@ -253,9 +253,9 @@ impl DprintExtension {
     Ok(vec!["lsp".into()])
   }
 
-  fn read_json_file(&self, worktree: &Worktree, path: &str) -> Option<Value> {
-    let contents = worktree.read_text_file(path).ok()?;
-    serde_json::from_str(&contents).ok()
+  fn read_json_file(&self, worktree: &Worktree, path: &str) -> zed::Result<Value> {
+    let contents = worktree.read_text_file(path)?;
+    serde_json::from_str(&contents).map_err(|error| format!("Could not read json file.{error:?}"))
   }
 
   fn worktree_dprint_binary_exists(&self, worktree: &Worktree) -> bool {
@@ -263,12 +263,12 @@ impl DprintExtension {
     let deno_json = self.read_json_file(worktree, "deno.json");
     let node_package_name = DPRINT_CONFIG.worktree.node_package_name;
 
-    let is_in_package_json = package_json.is_some_and(|f| {
+    let is_in_package_json = package_json.is_ok_and(|f| {
       !f["dependencies"][node_package_name].is_null()
         || !f["devDependencies"][node_package_name].is_null()
     });
 
-    let is_in_deno_json = deno_json.is_some_and(|f| !f["imports"][node_package_name].is_null());
+    let is_in_deno_json = deno_json.is_ok_and(|f| !f["imports"][node_package_name].is_null());
 
     if !(is_in_package_json || is_in_deno_json) {
       return false;
